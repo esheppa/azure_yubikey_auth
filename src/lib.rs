@@ -15,11 +15,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Debug;
-use std::ops::Add;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
-use std::time::SystemTime;
+use time::Duration;
 use time::OffsetDateTime;
 use uuid::Uuid;
 use yubikey::{
@@ -61,6 +59,7 @@ pub struct Config {
     pub pin: Secret,
     pub http_client: Arc<dyn HttpClient>,
     pub cache: Arc<Mutex<BTreeMap<String, AccessToken>>>,
+    pub yubikey_token_cache: Arc<Mutex<Option<AccessToken>>>,
 }
 
 impl Debug for Config {
@@ -97,9 +96,7 @@ impl TokenCredential for Config {
             }
         }
 
-        // while it is usually not ideal to use `warn!` in a library, in this case it makes sense
-        // as this message must be conveyed to the user
-        warn!("Requesting a new token. This will require a signature to be completed by the yubikey, please prepare to touch when it flashes");
+        debug!("Requesting a new token. This may require a signature to be completed by the yubikey, please prepare to touch when it flashes");
         let token = self.create_jwt()?;
 
         let resp = federated_credentials_flow::perform(
@@ -137,9 +134,20 @@ impl TokenCredential for Config {
 
 impl Config {
     pub fn create_jwt(&self) -> Result<String> {
+        let now = OffsetDateTime::now_utc();
+        let expires_in = time::Duration::minutes(120);
+
+        {
+            let cache = self.yubikey_token_cache.lock().unwrap();
+            if let Some(existing) = cache.as_ref() {
+                if existing.expires_on > now + time::Duration::seconds(5) {
+                    return Ok(existing.token.secret().to_string());
+                }
+            }
+        }
+
         let header = serde_json::to_vec(&self.header()?)?;
-        let claims =
-            serde_json::to_vec(&self.claims(SystemTime::now(), Duration::from_secs(5 * 60))?)?;
+        let claims = serde_json::to_vec(&self.claims(now, expires_in))?;
 
         let joined = [
             base64::encode_config(header, base64::URL_SAFE_NO_PAD),
@@ -150,6 +158,14 @@ impl Config {
         let sig = self.sign(&joined)?;
 
         let jwt = [joined, sig].join(".");
+
+        {
+            let mut cache = self.yubikey_token_cache.lock().unwrap();
+            *cache = Some(AccessToken {
+                token: azure_core::auth::Secret::new(jwt.clone()),
+                expires_on: now.saturating_add(expires_in),
+            })
+        }
 
         Ok(jwt)
     }
@@ -175,16 +191,20 @@ impl Config {
         }))
     }
 
-    fn claims(&self, now: SystemTime, length: Duration) -> Result<Value> {
-        Ok(json!({
-            "aud": format!("{}/{}/oauth2/v2.0/token", AZURE_PUBLIC_CLOUD.as_ref(), self.tenant_id),
-            "exp": timestamp(now.add(length))?,
+    fn claims(&self, now: OffsetDateTime, length: Duration) -> Value {
+        let data = json!({
+            "aud": format!("{}{}/oauth2/v2.0/token", AZURE_PUBLIC_CLOUD.as_ref(), self.tenant_id),
+            "exp": now.saturating_add(length).unix_timestamp(),
             "iss": self.client_id,
             "jti": Uuid::new_v4(),
-            "nbf": timestamp(now)?,
+            "nbf": now.unix_timestamp(),
             "sub": self.client_id,
-            "iat": timestamp(now)?
-        }))
+            "iat": now.unix_timestamp()
+        });
+
+        debug!("Claims: {data:?}");
+
+        data
     }
 
     fn sign(&self, input: &str) -> Result<String> {
@@ -196,6 +216,8 @@ impl Config {
 
         let padded = pkcs1v15_sign_pad(&padding.prefix, &hashed, 256)?;
 
+        // while it is usually not ideal to use `warn!` in a library, in this case it makes sense
+        // as this message must be conveyed to the user
         warn!("Requesting signature from the yubikey, please tap...");
         let sig_buf = piv::sign_data(
             &mut self.yubikey.lock().unwrap(),
@@ -211,22 +233,6 @@ impl Config {
             base64::URL_SAFE_NO_PAD,
         ))
     }
-}
-
-fn timestamp(t: SystemTime) -> Result<i64> {
-    let ts = match t.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(d) => d
-            .as_secs()
-            .try_into()
-            .map_err(|e| Error::full(ErrorKind::Other, e, "converting to timestamp"))?,
-        Err(d) => {
-            i64::try_from(d.duration().as_secs())
-                .map_err(|e| Error::full(ErrorKind::Other, e, "converting to timestamp"))?
-                * -1
-        }
-    };
-
-    Ok(ts)
 }
 
 // This is copied from the below location. It is not public API of that crate so it is necessary to replicate here

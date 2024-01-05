@@ -59,11 +59,46 @@ async fn main() -> Result<(), Box<dyn Error>> {
         pin: Secret::new(pin),
         http_client: azure_core::new_http_client(),
         cache: Arc::default(),
+        yubikey_token_cache: Arc::default(),
     };
+
+    println!("Requesting token");
+
+    let token = config
+        .get_token(&["https://storage.azure.com/.default"])
+        .await?;
+
+    println!("Got token 1: {token:?}");
+
+    let token = config
+        .get_token(&["https://storage.azure.com/.default"])
+        .await?;
+
+    println!("Got token 1a: {token:?}");
+
+    let token = config
+        .get_token(&["https://database.windows.net/.default"])
+        .await?;
+
+    println!("Got token 2: {token:?}");
+
+    let token = config
+        .get_token(&["https://database.windows.net/.default"])
+        .await?;
+
+    println!("Got token 2a: {token:?}");
 
     let token = config
         .get_token(&["https://graph.microsoft.com/.default"])
         .await?;
+
+    println!("Got token 3: {token:?}");
+
+    let token = config
+        .get_token(&["https://graph.microsoft.com/.default"])
+        .await?;
+
+    println!("Got token 3a: {token:?}");
 
     let client = reqwest::Client::new();
     let out = client
