@@ -12,9 +12,7 @@ use rsa::Pkcs1v15Sign;
 use serde_json::{json, Value};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Debug;
 use std::ops::Add;
@@ -62,7 +60,7 @@ pub struct Config {
     pub yubikey: Arc<Mutex<YubiKey>>,
     pub pin: Secret,
     pub http_client: Arc<dyn HttpClient>,
-    pub cache: Arc<Mutex<HashMap<BTreeSet<String>, AccessToken>>>,
+    pub cache: Arc<Mutex<BTreeMap<String, AccessToken>>>,
 }
 
 impl Debug for Config {
@@ -78,21 +76,24 @@ impl Debug for Config {
 #[async_trait]
 impl TokenCredential for Config {
     async fn get_token(&self, scopes: &[&str]) -> Result<AccessToken> {
-        // try to get the token for the requested scopes from the cache
-        let scopes_set = scopes
-            .iter()
-            .map(ToString::to_string)
-            .collect::<BTreeSet<_>>();
+        // https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow#second-case-access-token-request-with-a-certificate
+        // as per docs, only one scope allowed...
+        if scopes.len() > 1 {
+            return Err(azure_core::error::Error::new(
+                ErrorKind::Other,
+                format!("Unable to get a token for multiple scopes, requsted: {scopes:?}"),
+            ));
+        }
+
+        let scope = scopes[0].to_string();
 
         {
-            let mut cache = self.cache.lock().unwrap();
+            let cache = self.cache.lock().unwrap();
 
-            // remove expired tokens
-            cache.retain(|_, token| token.expires_on > OffsetDateTime::now_utc());
-
-            // find a superset token if it remains
-            if let Some((_, token)) = cache.iter().find(|(set, _)| set.is_superset(&scopes_set)) {
-                return Ok(token.clone());
+            if let Some(existing) = cache.get(&scope) {
+                if existing.expires_on > OffsetDateTime::now_utc() + time::Duration::seconds(5) {
+                    return Ok(existing.clone());
+                }
             }
         }
 
@@ -105,7 +106,7 @@ impl TokenCredential for Config {
             self.http_client.clone(),
             &self.client_id.to_string(),
             &token,
-            scopes,
+            &[&scope],
             &self.tenant_id.to_string(),
             &AZURE_PUBLIC_CLOUD,
         )
@@ -114,19 +115,22 @@ impl TokenCredential for Config {
         let token = AccessToken {
             token: resp.access_token,
             expires_on: resp.expires_on.unwrap_or_else(|| {
-                OffsetDateTime::now_utc().saturating_add(time::Duration::minutes(10))
+                // https://learn.microsoft.com/en-us/entra/identity-platform/access-tokens#token-lifetime
+                // we just want a little below the minimum
+                OffsetDateTime::now_utc().saturating_add(time::Duration::minutes(55))
             }),
         };
 
         {
             let mut cache = self.cache.lock().unwrap();
-            cache.insert(scopes_set, token.clone());
+            cache.insert(scope, token.clone());
         }
 
         Ok(token)
     }
+
     async fn clear_cache(&self) -> Result<()> {
-        *self.cache.lock().unwrap() = HashMap::new();
+        *self.cache.lock().unwrap() = BTreeMap::new();
         Ok(())
     }
 }
