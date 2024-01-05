@@ -1,8 +1,10 @@
 use async_trait::async_trait;
+use azure_core::auth::AccessToken;
 use azure_core::auth::TokenCredential;
+use azure_core::authority_hosts::AZURE_PUBLIC_CLOUD;
 use azure_core::error::ErrorKind;
 use azure_core::Error;
-use azure_identity::authority_hosts::AZURE_PUBLIC_CLOUD;
+// use azure_identity::AZURE_PUBLIC_CLOUD;
 use der::Encode;
 use log::debug;
 use log::warn;
@@ -10,7 +12,11 @@ use rsa::Pkcs1v15Sign;
 use serde_json::{json, Value};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
+use std::fmt::Debug;
 use std::ops::Add;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -23,7 +29,7 @@ use yubikey::{
     Certificate, YubiKey,
 };
 
-use azure_core::{auth::TokenResponse, error::Result, HttpClient};
+use azure_core::{error::Result, HttpClient};
 use azure_identity::federated_credentials_flow;
 
 #[derive(Clone)]
@@ -56,38 +62,76 @@ pub struct Config {
     pub yubikey: Arc<Mutex<YubiKey>>,
     pub pin: Secret,
     pub http_client: Arc<dyn HttpClient>,
+    pub cache: Arc<Mutex<HashMap<BTreeSet<String>, AccessToken>>>,
+}
+
+impl Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("tenant_id", &self.tenant_id)
+            .field("client_id", &self.client_id)
+            .field("cache", &self.cache.lock().unwrap().len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[async_trait]
 impl TokenCredential for Config {
-    async fn get_token(&self, resource: &str) -> Result<TokenResponse> {
-        self.get_token(resource).await
-    }
-}
+    async fn get_token(&self, scopes: &[&str]) -> Result<AccessToken> {
+        // try to get the token for the requested scopes from the cache
+        let scopes_set = scopes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
 
-impl Config {
-    pub async fn get_token(&self, resource: &str) -> Result<TokenResponse> {
+        {
+            let mut cache = self.cache.lock().unwrap();
+
+            // remove expired tokens
+            cache.retain(|_, token| token.expires_on > OffsetDateTime::now_utc());
+
+            // find a superset token if it remains
+            if let Some((_, token)) = cache.iter().find(|(set, _)| set.is_superset(&scopes_set)) {
+                return Ok(token.clone());
+            }
+        }
+
         // while it is usually not ideal to use `warn!` in a library, in this case it makes sense
         // as this message must be conveyed to the user
         warn!("Requesting a new token. This will require a signature to be completed by the yubikey, please prepare to touch when it flashes");
         let token = self.create_jwt()?;
-        
+
         let resp = federated_credentials_flow::perform(
             self.http_client.clone(),
             &self.client_id.to_string(),
             &token,
-            &[resource],
+            scopes,
             &self.tenant_id.to_string(),
-            AZURE_PUBLIC_CLOUD,
+            &AZURE_PUBLIC_CLOUD,
         )
         .await?;
 
-        Ok(TokenResponse {
+        let token = AccessToken {
             token: resp.access_token,
-            expires_on: resp.expires_on.unwrap_or(OffsetDateTime::UNIX_EPOCH),
-        })
-    }
+            expires_on: resp.expires_on.unwrap_or_else(|| {
+                OffsetDateTime::now_utc().saturating_add(time::Duration::minutes(10))
+            }),
+        };
 
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.insert(scopes_set, token.clone());
+        }
+
+        Ok(token)
+    }
+    async fn clear_cache(&self) -> Result<()> {
+        *self.cache.lock().unwrap() = HashMap::new();
+        Ok(())
+    }
+}
+
+impl Config {
     pub fn create_jwt(&self) -> Result<String> {
         let header = serde_json::to_vec(&self.header()?)?;
         let claims =
@@ -113,7 +157,7 @@ impl Config {
             .cert
             .to_der()
             .map_err(|e| Error::full(ErrorKind::Other, e, "convert certificate to DER"))?;
-        
+
         // we need Sha1 for the certificate thumbprint as that is how the format is defined
         let mut hasher = Sha1::new();
         hasher.update(&data);
@@ -129,7 +173,7 @@ impl Config {
 
     fn claims(&self, now: SystemTime, length: Duration) -> Result<Value> {
         Ok(json!({
-            "aud": format!("{AZURE_PUBLIC_CLOUD}/{}/oauth2/v2.0/token", self.tenant_id),
+            "aud": format!("{}/{}/oauth2/v2.0/token", AZURE_PUBLIC_CLOUD.as_ref(), self.tenant_id),
             "exp": timestamp(now.add(length))?,
             "iss": self.client_id,
             "jti": Uuid::new_v4(),

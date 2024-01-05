@@ -1,3 +1,4 @@
+use azure_core::auth::TokenCredential;
 use azure_yubikey_auth::{Config, Secret};
 use rustyline::config::Configurer;
 use rustyline::highlight::Highlighter;
@@ -57,10 +58,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         yubikey: Arc::new(Mutex::new(yubikey)),
         pin: Secret::new(pin),
         http_client: azure_core::new_http_client(),
+        cache: Arc::default(),
     };
 
     let token = config
-        .get_token("https://graph.microsoft.com/.default")
+        .get_token(&["https://graph.microsoft.com/.default"])
         .await?;
 
     let client = reqwest::Client::new();
