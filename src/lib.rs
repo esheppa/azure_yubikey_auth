@@ -14,10 +14,12 @@ use serde_json::{json, Value};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::MutexGuard;
 use time::Duration;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -56,11 +58,25 @@ impl fmt::Debug for Secret {
 pub struct Config {
     pub tenant_id: Uuid,
     pub client_id: Uuid, // principal_id / application_id (but _NOT_ the object_id!)
-    pub yubikey: Arc<Mutex<YubiKey>>,
     pub pin: Secret,
     pub http_client: Arc<dyn HttpClient>,
-    pub cache: Arc<Mutex<BTreeMap<String, AccessToken>>>,
-    pub yubikey_token_cache: Arc<Mutex<Option<AccessToken>>>,
+    pub shared: Arc<Mutex<Shared>>,
+}
+
+pub struct Shared {
+    yubikey: YubiKey,
+    cache: BTreeMap<BTreeSet<String>, AccessToken>,
+    yubikey_token_cache: Option<AccessToken>,
+}
+
+impl Shared {
+    pub fn new(yubikey: YubiKey) -> Arc<Mutex<Shared>> {
+        Arc::new(Mutex::new(Shared {
+            yubikey,
+            cache: BTreeMap::default(),
+            yubikey_token_cache: None,
+        }))
+    }
 }
 
 impl Debug for Config {
@@ -68,7 +84,7 @@ impl Debug for Config {
         f.debug_struct("Config")
             .field("tenant_id", &self.tenant_id)
             .field("client_id", &self.client_id)
-            .field("cache", &self.cache.lock().unwrap().len())
+            .field("cache", &self.shared.lock().unwrap().cache.len())
             .finish_non_exhaustive()
     }
 }
@@ -76,25 +92,28 @@ impl Debug for Config {
 #[async_trait]
 impl TokenCredential for Config {
     async fn get_token(&self, scopes: &[&str]) -> Result<AccessToken> {
-        // https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow#second-case-access-token-request-with-a-certificate
-        // as per docs, only one scope allowed...
-        if scopes.len() > 1 {
-            return Err(azure_core::error::Error::new(
-                ErrorKind::Other,
-                format!("Unable to get a token for multiple scopes, requsted: {scopes:?}"),
-            ));
-        }
+        let scopes_set = scopes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
 
-        let scope = scopes[0].to_string();
+        let res = self.with_shared(|mut sh| {
+            sh.cache.retain(|_, token| {
+                token.expires_on > OffsetDateTime::now_utc() + time::Duration::seconds(5)
+            });
 
-        {
-            let cache = self.cache.lock().unwrap();
-
-            if let Some(existing) = cache.get(&scope) {
-                if existing.expires_on > OffsetDateTime::now_utc() + time::Duration::seconds(5) {
-                    return Ok(existing.clone());
-                }
+            if let Some((_, existing)) = sh
+                .cache
+                .iter()
+                .find(|(scopes, _)| scopes.is_superset(&scopes_set))
+            {
+                return Some(existing.clone());
             }
+            None
+        });
+
+        if let Some(res) = res {
+            return Ok(res);
         }
 
         debug!("Requesting a new token. This may require a signature to be completed by the yubikey, please prepare to touch when it flashes");
@@ -104,7 +123,7 @@ impl TokenCredential for Config {
             self.http_client.clone(),
             &self.client_id.to_string(),
             &token,
-            &[&scope],
+            scopes,
             &self.tenant_id.to_string(),
             &AZURE_PUBLIC_CLOUD,
         )
@@ -119,56 +138,65 @@ impl TokenCredential for Config {
             }),
         };
 
-        {
-            let mut cache = self.cache.lock().unwrap();
-            cache.insert(scope, token.clone());
-        }
+        self.with_shared(|mut sh| sh.cache.insert(scopes_set, token.clone()));
 
         Ok(token)
     }
 
     async fn clear_cache(&self) -> Result<()> {
-        *self.cache.lock().unwrap() = BTreeMap::new();
+        self.with_shared(|mut sh| {
+            sh.cache.clear();
+        });
         Ok(())
     }
 }
 
 impl Config {
+    fn with_shared<'a, T>(&'a self, func: impl FnOnce(MutexGuard<'a, Shared>) -> T) -> T {
+        func(self.shared.lock().unwrap())
+    }
+
     pub fn create_jwt(&self) -> Result<String> {
+        self.with_shared(|mut sh| self.create_jwt_inner(&mut sh))
+    }
+
+    // we require the lock to be held for the entirety of this function
+    // while this may seem suboptimal as the `sign` part will block
+    // on user input on the yubikey,
+    // this makes sense, as all other requests should queue up behind the
+    // first yubikey touch such that they can use the newly cached
+    // yubikey signed token.
+    // we definitely don't want users to have to do multiple touches
+    // where one would have sufficed
+    fn create_jwt_inner(&self, sh: &mut Shared) -> Result<String> {
         let now = OffsetDateTime::now_utc();
         let expires_in = time::Duration::minutes(120);
 
-        {
-            let cache = self.yubikey_token_cache.lock().unwrap();
-            if let Some(existing) = cache.as_ref() {
-                if existing.expires_on > now + time::Duration::seconds(5) {
-                    return Ok(existing.token.secret().to_string());
-                }
+        if let Some(existing) = sh.yubikey_token_cache.as_ref() {
+            if existing.expires_on > now + time::Duration::seconds(5) {
+                return Ok(existing.token.secret().to_string());
             }
         }
 
-        let header = serde_json::to_vec(&self.header()?)?;
+        let header = serde_json::to_vec(&self.header(sh)?)?;
         let claims = serde_json::to_vec(&self.claims(now, expires_in))?;
 
-        let joined = [encode_slice(&header)?, encode_slice(&claims)?].join(".");
+        let joined = [encode_slice(&header), encode_slice(&claims)].join(".");
 
-        let sig = self.sign(&joined)?;
+        let sig = self.sign(&joined, sh)?;
 
         let jwt = [joined, sig].join(".");
 
-        {
-            let mut cache = self.yubikey_token_cache.lock().unwrap();
-            *cache = Some(AccessToken {
-                token: azure_core::auth::Secret::new(jwt.clone()),
-                expires_on: now.saturating_add(expires_in),
-            })
-        }
+        sh.yubikey_token_cache = Some(AccessToken {
+            token: azure_core::auth::Secret::new(jwt.clone()),
+            expires_on: now.saturating_add(expires_in),
+        });
 
         Ok(jwt)
     }
 
-    fn header(&self) -> Result<Value> {
-        let cert = Certificate::read(&mut self.yubikey.lock().unwrap(), SlotId::Signature)
+    fn header(&self, sh: &mut Shared) -> Result<Value> {
+        let cert = Certificate::read(&mut sh.yubikey, SlotId::Signature)
             .map_err(|e| Error::full(ErrorKind::Other, e, "reading certificate from yuibkey"))?;
         let data = cert
             .cert
@@ -179,7 +207,7 @@ impl Config {
         let mut hasher = Sha1::new();
         hasher.update(&data);
 
-        let x5t = encode_slice(hasher.finalize().as_slice())?;
+        let x5t = encode_slice(hasher.finalize().as_slice());
 
         Ok(json!({
             "alg": "RS256",
@@ -204,7 +232,7 @@ impl Config {
         data
     }
 
-    fn sign(&self, input: &str) -> Result<String> {
+    fn sign(&self, input: &str, sh: &mut Shared) -> Result<String> {
         let mut hasher = Sha256::new();
         hasher.update(input.as_bytes());
         let hashed = hasher.finalize();
@@ -217,7 +245,7 @@ impl Config {
         // as this message must be conveyed to the user
         warn!("Requesting signature from the yubikey, please tap...");
         let sig_buf = piv::sign_data(
-            &mut self.yubikey.lock().unwrap(),
+            &mut sh.yubikey,
             &padded,
             AlgorithmId::Rsa2048,
             SlotId::Signature,
@@ -225,24 +253,12 @@ impl Config {
         .map_err(|e| Error::full(ErrorKind::Other, e, "signing data using yuibkey"))?;
         debug!("Signature successfully completed");
 
-        encode_slice(sig_buf.as_slice())
+        Ok(encode_slice(sig_buf.as_slice()))
     }
 }
 
-#[allow(clippy::slow_vector_initialization)]
-fn encode_slice(slice: &[u8]) -> Result<String> {
-    let mut out_buf = Vec::new();
-    out_buf.resize(slice.len() * 4 / 3 + 4, 0);
-
-    let written = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode_slice(slice, &mut out_buf)
-        .map_err(|e| Error::full(ErrorKind::Other, e, "Could not encode."))?;
-
-    out_buf.truncate(written);
-
-    String::from_utf8(out_buf)
-        .map_err(|e| Error::full(ErrorKind::Other, e, "Could not convert to UTF-8 string."))
-        
+fn encode_slice(slice: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(slice)
 }
 
 // This is copied from the below location. It is not public API of that crate so it is necessary to replicate here
