@@ -11,8 +11,6 @@ use std::env;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 
-use tokio;
-
 #[derive(Completer, Helper, Hinter, Validator)]
 struct MaskingHighlighter {
     masking: bool,
@@ -28,7 +26,7 @@ impl Highlighter for MaskingHighlighter {
         }
     }
 
-    fn highlight_char(&self, _line: &str, _pos: usize) -> bool {
+    fn highlight_char(&self, _line: &str, _pos: usize, _forced: bool) -> bool {
         self.masking
     }
 }
