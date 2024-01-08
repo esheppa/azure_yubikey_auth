@@ -4,6 +4,7 @@ use azure_core::auth::TokenCredential;
 use azure_core::authority_hosts::AZURE_PUBLIC_CLOUD;
 use azure_core::error::ErrorKind;
 use azure_core::Error;
+use base64::Engine;
 // use azure_identity::AZURE_PUBLIC_CLOUD;
 use der::Encode;
 use log::debug;
@@ -149,11 +150,7 @@ impl Config {
         let header = serde_json::to_vec(&self.header()?)?;
         let claims = serde_json::to_vec(&self.claims(now, expires_in))?;
 
-        let joined = [
-            base64::encode_config(header, base64::URL_SAFE_NO_PAD),
-            base64::encode_config(claims, base64::URL_SAFE_NO_PAD),
-        ]
-        .join(".");
+        let joined = [encode_slice(&header)?, encode_slice(&claims)?].join(".");
 
         let sig = self.sign(&joined)?;
 
@@ -182,7 +179,7 @@ impl Config {
         let mut hasher = Sha1::new();
         hasher.update(&data);
 
-        let x5t = base64::encode_config(hasher.finalize().as_slice(), base64::URL_SAFE_NO_PAD);
+        let x5t = encode_slice(hasher.finalize().as_slice())?;
 
         Ok(json!({
             "alg": "RS256",
@@ -228,11 +225,24 @@ impl Config {
         .map_err(|e| Error::full(ErrorKind::Other, e, "signing data using yuibkey"))?;
         debug!("Signature successfully completed");
 
-        Ok(base64::encode_config(
-            sig_buf.as_slice(),
-            base64::URL_SAFE_NO_PAD,
-        ))
+        encode_slice(sig_buf.as_slice())
     }
+}
+
+#[allow(clippy::slow_vector_initialization)]
+fn encode_slice(slice: &[u8]) -> Result<String> {
+    let mut out_buf = Vec::new();
+    out_buf.resize(slice.len() * 4 / 3 + 4, 0);
+
+    let written = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode_slice(slice, &mut out_buf)
+        .map_err(|e| Error::full(ErrorKind::Other, e, "Could not encode."))?;
+
+    out_buf.truncate(written);
+
+    String::from_utf8(out_buf)
+        .map_err(|e| Error::full(ErrorKind::Other, e, "Could not convert to UTF-8 string."))
+        
 }
 
 // This is copied from the below location. It is not public API of that crate so it is necessary to replicate here
