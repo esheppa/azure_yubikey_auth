@@ -1,5 +1,6 @@
 use azure_core::auth::TokenCredential;
-use azure_yubikey_auth::{Config, Secret};
+use azure_yubikey_auth::{Config, Secret, Shared};
+use color_eyre::eyre::Context;
 use rustyline::config::Configurer;
 use rustyline::highlight::Highlighter;
 use rustyline::{ColorMode, Editor};
@@ -8,8 +9,6 @@ use yubikey::YubiKey;
 
 use std::borrow::Cow;
 use std::env;
-use std::error::Error;
-use std::sync::{Arc, Mutex};
 
 #[derive(Completer, Helper, Hinter, Validator)]
 struct MaskingHighlighter {
@@ -32,8 +31,8 @@ impl Highlighter for MaskingHighlighter {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::init();
+async fn main() -> color_eyre::Result<()> {
+    tracing_subscriber::fmt::init();
 
     let h = MaskingHighlighter { masking: false };
     let mut rl = Editor::new()?;
@@ -47,26 +46,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     yubikey.verify_pin(pin.trim().as_bytes())?;
     println!("Pin successfully verified");
 
-    let tenant_id = env::var("TENANT_ID")?;
-    let client_id = env::var("CLIENT_ID")?;
+    let tenant_id =
+        env::var("TENANT_ID").context("Unable to find environment variable `TENANT_ID`")?;
+    let client_id =
+        env::var("CLIENT_ID").context("Unable to find environment variable `CLIENT_ID`")?;
 
     let config = Config {
         tenant_id: tenant_id.parse()?,
         client_id: client_id.parse()?,
-        yubikey: Arc::new(Mutex::new(yubikey)),
         pin: Secret::new(pin),
         http_client: azure_core::new_http_client(),
-        cache: Arc::default(),
-        yubikey_token_cache: Arc::default(),
+        shared: Shared::new(yubikey),
     };
 
     println!("Requesting token");
 
-    let token = config
-        .get_token(&["https://storage.azure.com/.default"])
-        .await?;
+    // let token = config
+    //     .get_token(&[])
+    //     .await?;
 
-    println!("Got token 1: {token:?}");
+    // println!("Got token 1: {token:?}");
 
     let token = config
         .get_token(&["https://storage.azure.com/.default"])
